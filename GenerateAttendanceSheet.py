@@ -15,9 +15,9 @@ def load_data(participants_file, registrants_file, delegates_file, groups_file):
     """Loads all input files into pandas DataFrames or lists."""
     try:
         participants_df = pd.read_csv(participants_file, usecols=['user_name', 'email']).fillna('')
-        registrants_df = pd.read_excel(registrants_file, usecols=['Billing-Email', 'First Name', 'Last Name', 'Preferred Name']).fillna('')
+        registrants_df = pd.read_excel(registrants_file, usecols=['Billing-Email', 'Local Group', 'First Name', 'Last Name', 'Preferred Name']).fillna('')
         # Delegates file has no header
-        delegates_df = pd.read_excel(delegates_file, header=None, names=['full_name', 'email']).fillna('')
+        delegates_df = pd.read_excel(delegates_file, header=None, names=['local_group', 'full_name', 'email']).fillna('')
         
         with open(groups_file, 'r') as f:
             groups_list = [line.strip() for line in f if line.strip()]
@@ -48,25 +48,32 @@ def build_group_lookup(groups_list):
     return lookup
 
 def find_best_group_match(user_name, group_lookup):
-    """Attempts to find a member group from the user_name string."""
-    parts = user_name.lower().split()
-    # Check for multi-word group names first (e.g., 'canada bay')
-    if len(parts) >= 2:
-        two_word_key = f"{parts[0]} {parts[1]}"
-        if two_word_key in group_lookup:
-            return group_lookup[two_word_key]
-    # Check for single-word or initials
-    if len(parts) >= 1:
-        one_word_key = parts[0]
-        if one_word_key in group_lookup:
-            return group_lookup[one_word_key]
+    """Search for any group name within the user_name string."""
+    clean_name = normalise_name(user_name)
+    nospace_name = clean_name.replace(" ", "")
+    
+    for group_key, group_value in group_lookup.items():
+        gk = group_key.lower()
+        
+        # First pass: strict word boundary
+        pattern = r'\b' + re.escape(gk) + r'\b'
+        if re.search(pattern, clean_name):
+            return group_value
+        
+        # Second pass: ignore spaces (handles 'southernhighlands')
+        if gk.replace(" ", "") in nospace_name:
+            return group_value
+    
     return "Unknown"
 
-def normalize_name(name):
-    """Prepares a name string for comparison."""
-    return re.sub(r'[^a-z0-9]', '', name.lower())
+def normalise_name(name):
+    """Lowercase and strip punctuation except spaces."""
+    text = name.lower()
+    text = re.sub(r'[^a-z\s]', ' ', text)  # keep only letters and spaces
+    text = re.sub(r'(they|them|her|him|she|he)', '', text)
+    return re.sub(r'\s+', ' ', text).strip()
 
-def analyze_attendance(participants_df, registrants_df, delegates_df, groups_list):
+def analyze_attendance(participants_df, registrants_df, delegates_df, groups_list, delegates_not_registered):
     """
     Performs the core analysis, matching participants against other lists.
     """
@@ -82,59 +89,36 @@ def analyze_attendance(participants_df, registrants_df, delegates_df, groups_lis
         is_delegate = False
         match_rules = []
         
-        # 1. Find Member Group
+        # Initial group guess based on user_name
         local_group = find_best_group_match(zoom_user_name, group_lookup)
 
-        # 2. Isolate the potential name from the user_name
-        # This new block cleanly handles observers who don't provide a group name.
-        potential_name = re.sub(r'\(.*?\)', '', zoom_user_name).strip() # Remove (pronouns) etc.
-        if local_group != "Unknown":
-            # If a group was found, attempt to remove it to isolate the person's name.
-            # We use the cleaned group name for more reliable stripping.
-            group_name_base = local_group.replace(" Greens", "")
-            potential_name = re.sub(re.escape(group_name_base), '', potential_name, flags=re.IGNORECASE).strip()
-        
-        # 3. Match against Registrants
-        # Attempt 1: Match by email (most reliable)
-        if zoom_email:
-            reg_match = registrants_df[registrants_df['Billing-Email'].str.lower().str.strip() == zoom_email]
-            if not reg_match.empty:
-                is_registered = True
-                matched_email = reg_match.iloc[0]['Billing-Email']
-                match_rules.append(f"Registered: Zoom email '{zoom_email}' == CiviCRM Billing-Email '{matched_email}'")
+        # Match by name (if email fails)
+        norm_zoom_name = re.sub(f"{local_group}", '', normalise_name(zoom_user_name))
+        for _, r_row in registrants_df.iterrows():
+            sort_name = r_row['Last Name'] + ', ' + r_row['First Name']
+            if ',' in sort_name:
+                last, first = [s.strip() for s in sort_name.split(',', 1)]
+                norm_reg_name = normalise_name(f"{first}{last}")
+                if norm_reg_name in norm_zoom_name or norm_zoom_name in norm_reg_name:
+                    is_registered = True
+                    match_rules.append(f"Registered: Zoom name '{norm_zoom_name}' ~ CiviCRM Sort Name '{sort_name}'")
+                    # Use registrant’s Local Group if available
+                    if pd.notna(r_row.get('Local Group', None)) and r_row['Local Group'].strip():
+                        local_group = r_row['Local Group'].strip()
+                        match_rules.append(f"Local Group refined from registrant record: '{local_group}'")
+                    break
 
-        # Attempt 2: Match by name (if email fails)
-        if not is_registered and len(potential_name.split()) >= 2:
-            norm_zoom_name = normalize_name(potential_name)
-            for _, r_row in registrants_df.iterrows():
-                # CiviCRM 'Sort Name' is often 'LastName, FirstName'
-                sort_name = r_row['Last Name'] + ', ' + r_row['First Name']
-                if ',' in sort_name:
-                    last, first = [s.strip() for s in sort_name.split(',', 1)]
-                    norm_reg_name = normalize_name(f"{first}{last}")
-                    if norm_reg_name in norm_zoom_name or norm_zoom_name in norm_reg_name:
-                         is_registered = True
-                         match_rules.append(f"Registered: Zoom name '{potential_name}' ~ CiviCRM Sort Name '{sort_name}'")
-                         break # Stop after first name match
-
-        # 4. Match against Delegates
-        # Attempt 1: Match by email
-        if zoom_email:
-            del_match = delegates_df[delegates_df['email'].str.lower().str.strip() == zoom_email]
-            if not del_match.empty:
-                is_delegate = True
-                matched_email = del_match.iloc[0]['email']
-                match_rules.append(f"Delegate: Zoom email '{zoom_email}' == Delegate email '{matched_email}'")
-        
-        # Attempt 2: Match by name (if email fails or doesn't exist)
-        if not is_delegate and is_registered and len(potential_name.split()) >= 2: # Only try name-matching if they are at least registered
-            norm_zoom_name = normalize_name(potential_name)
+        # Match against Delegates
+        norm_zoom_name = normalise_name(norm_zoom_name)
+         # Match by name (if email fails or doesn't exist)
+        if is_registered or not delegates_not_registered:
             for _, d_row in delegates_df.iterrows():
-                delegate_name = d_row['full_name']
-                norm_del_name = normalize_name(delegate_name)
-                if norm_del_name in norm_zoom_name or norm_zoom_name in norm_del_name:
+                delegate_name = normalise_name(d_row['full_name'])
+                if delegate_name in norm_zoom_name or norm_zoom_name in delegate_name:
                     is_delegate = True
-                    match_rules.append(f"Delegate: Zoom name '{potential_name}' ~ Delegate name '{delegate_name}'")
+                    if 'Unknown' == local_group:
+                        local_group = d_row['local_group']
+                    match_rules.append(f"Delegate: Zoom name '{norm_zoom_name}' ~ Delegate name '{delegate_name}'")
                     break
 
         # --- Compile the final record for this participant ---
@@ -148,7 +132,6 @@ def analyze_attendance(participants_df, registrants_df, delegates_df, groups_lis
         })
         
     return results
-
 
 def write_output(results, output_file):
     """Writes the final analysis to a CSV file."""
@@ -190,6 +173,11 @@ def main():
         help=f"Path to the delegates XLSX file. (default: {DEFAULT_DELEGATES_FILE})"
     )
     parser.add_argument(
+        '--delegates_not_registered', 
+        action='store_true',
+        help="Assume Delegates are not Registered attendees."
+    )
+    parser.add_argument(
         '--groups', 
         default=DEFAULT_GROUPS_FILE,
         help=f"Path to the member groups TXT file. (default: {DEFAULT_GROUPS_FILE})"
@@ -212,7 +200,7 @@ def main():
         args.participants, args.registrants, args.delegates, args.groups
     )
     
-    analysis_results = analyze_attendance(participants, registrants, delegates, groups)
+    analysis_results = analyze_attendance(participants, registrants, delegates, groups, args.delegates_not_registered)
     
     write_output(analysis_results, args.output)
 

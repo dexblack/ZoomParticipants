@@ -5,6 +5,9 @@ import requests
 import csv
 import base64
 import json
+from datetime import datetime
+import pytz
+
 
 ZOOM_TOKEN_URL = "https://zoom.us/oauth/token"
 ZOOM_PARTICIPANTS_URL = "https://api.zoom.us/v2/metrics/meetings/{}/participants"
@@ -60,13 +63,23 @@ def get_all_participants(meeting_id, access_token):
 
     return participants
 
+def iso_to_local(iso_str):
+    if not iso_str:  # Handle blank values (e.g. leave_time still empty)
+        return ""
+    dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))  # parse ISO8601
+    local_tz = datetime.now().astimezone().tzinfo  # system local timezone
+    return dt.astimezone(local_tz).strftime("%Y-%m-%d %H:%M:%S")
+
 def write_csv(participants, output_path):
-    fields = ["status", "join_time", "leave_time", "user_name", "email", "participant_user_id", "pc_name", "client", "browser_name", "device_name"]
+    fields = ["status", "join_time", "leave_time", "user_name", "email", 
+              "participant_user_id", "pc_name", "client", "browser_name", "device_name"]
     with open(output_path, "w", newline='', encoding='utf-8') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fields)
         writer.writeheader()
         for p in participants:
             row = {k: p.get(k, "") for k in fields}
+            row["join_time"] = iso_to_local(row["join_time"])
+            row["leave_time"] = iso_to_local(row["leave_time"])
             writer.writerow(row)
 
 def handle_http_error(response):
